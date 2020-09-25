@@ -1,0 +1,243 @@
+---
+title: "MA615 Buoy Project"
+author: "Xiaozhou Lu (Leo)"
+date: "2020/9/25"
+output:
+  html_document:
+    df_print: paged
+---
+1 Introduction
+
+Nowdays, global warming has become a trend that arouse the attention of global concerns. We want to use statistical analysis to figure out the evidence of global warming and try to see how the trend is actually going. Therefore, we collect the data about the temperature both in air and seas in Boston ranging from 1990-2010 and analysis the result. First we import the data from NDBC website, and get it cleaned.Then we use linear regression to fit the model an try to find out if the slope is going up or going down. After that we use time series to draw a temperature charts as an assistance.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load("knitr","ggplot2","rstanarm","tidyverse","lubridate","zoo","astsa")
+```
+
+## Abstract data from website
+
+```{r}
+### make URLs
+
+url1 <- "http://www.ndbc.noaa.gov/view_text_file.php?filename=mlrf1h"
+url2 <- ".txt.gz&dir=data/historical/stdmet/"
+
+years <- c(1987:2016)
+
+urls <- str_c(url1, years, url2, sep = "")
+
+filenames <- str_c("ma", years, sep = "")
+
+###  Read the data from the website
+
+N <- length(urls)
+
+for (i in 1:N){
+  suppressMessages( ###  This stops the annoying messages on your screen.  Do this last.
+    assign(filenames[i], read_table(urls[i], col_names = TRUE))
+  )
+  
+  file <- get(filenames[i])
+  
+  x <- ncol(file)
+
+  
+  
+#Since data from different year has different columns, we seperate them and only take the columns we want  
+  if(x %in% c(15,16)){
+      colnames(file)[1] <-"YYYY"
+      colnames(file)[2] <-"MM"
+      colnames(file)[3] <-"DD"
+      colnames(file)[4] <-"hh"
+      colnames(file)[12] <-"Air_tmp"
+      colnames(file)[13] <-"Water_tmp"
+      file <- file[,c(1,2,3,4,12,13)]
+  }
+
+   if(x==17){
+      colnames(file)[1] <-"YYYY"
+      colnames(file)[2] <-"MM"
+      colnames(file)[3] <-"DD"
+      colnames(file)[4] <-"hh"
+      colnames(file)[13] <-"Air_tmp"
+      colnames(file)[14] <-"Water_tmp"
+      file <- file[,c(1,2,3,4,13,14)]
+  }
+
+#Combine all dataframes
+  if(i == 1){
+    MR <- file
+  }
+
+  else{
+    MR <- rbind.data.frame(MR, file)
+  }
+}
+```
+
+2 Data Cleaning
+
+We get thousands of data imported from the website. And many of them are not useful for our analysis. And we try to reduce the amount of the observations, since they are too many, without leaving out essential information contained.
+So we try to get daily average temperature and use it to get monthly average temperature. Our model will then be based on monthly average temperature. We decide to build our model monthly, so that we can ignore the influence of season changes on the temperature.
+
+## Clean data
+```{r}
+MR_2 <- as_tibble(MR)
+#Change type of Air_tmp and Water_tmp from chr to dbl
+MR_2 <- MR_2 %>%
+  mutate(Air_tmp = as.double(Air_tmp),
+         Water_tmp = as.double(Water_tmp),
+         YYYY_MM_DD = ymd(paste(YYYY,MM,DD,sep = "-"))) %>%
+  relocate(YYYY_MM_DD)
+
+#Get rid of tittle line
+MR_2 <- filter(MR_2,hh != "hr")
+
+#Get rid of abnormal data
+MR_2 <- filter(MR_2,Air_tmp < 100, Water_tmp < 100)
+
+#Get daily average Tmp
+MR_3_1 <- select(MR_2,-c(2,3,4,7)) %>%
+  group_by(YYYY_MM_DD) %>%
+  summarize(Avg_Air_tmp = mean(Air_tmp))
+
+MR_3_2 <- select(MR_2,-c(2,3,4,6)) %>%
+  group_by(YYYY_MM_DD) %>%
+  summarize(Avg_Water_tmp = mean(Water_tmp))
+
+#Get monthly average Tmp
+MR_4_1 <- MR_3_1 %>%
+  group_by(month = floor_date(YYYY_MM_DD,"month")) %>%
+  summarize(Avg_Air_tmp = mean(Avg_Air_tmp))
+
+MR_4_2 <- MR_3_2 %>%
+  group_by(month = floor_date(YYYY_MM_DD,"month")) %>%
+  summarize(Avg_Water_tmp = mean(Avg_Water_tmp))
+
+MR_4 <- inner_join(MR_4_1,MR_4_2)
+
+#Export data
+write_csv(MR_4,"MR_data_1987_2016.csv")
+
+view(MR_4)
+```
+
+3 First Interpretation
+
+With the data set we need, we first want to have a brief understanding about the condition. So we draw a line chart from both air temperature and water temperature versus the date. And we get the graphs as follows.
+
+##Fit model
+```{r}
+#Plot data
+MR_4 %>%
+  ggplot(aes(x = month,y = Avg_Air_tmp)) + 
+  geom_line() +
+  geom_point()
+
+MR_4 %>%
+  ggplot(aes(x = month,y = Avg_Water_tmp)) + 
+  geom_line() +
+  geom_point()
+
+#Check the trend within a year
+MR_1988 <- filter(MR_4,year(month)==1988)
+MR_1988 %>%
+  ggplot(aes(x = month, y = Avg_Air_tmp)) +
+  geom_line() +
+  geom_point()
+```
+
+From the chart above, we get a normal feeling how the temperature is supposed to change seasonally. And we can see a slight hint that the temperature is actuallly going higher. But these are just our first impression in our eyes. We need more rigorous statistcal analysis to make our conclusion more convincing.
+
+
+4 Linear Regression
+
+We now use linear regression to find a fit between temperature and date, then we get to analysis the coefficient to see whether their trend is going upwards or downwards.
+
+###Fit time series model
+```{r}
+#Red indicates an upward trend
+#Blue indicates an downward trend
+
+#plot air_tmp
+par(mfrow=c(3,4))
+for(i in 1:12){
+  LM_MR_4_1 <- filter(MR_4_1,month(month)==i)
+  LM_1 <- lm(Avg_Air_tmp~month,data = LM_MR_4_1)
+
+  if(coef(LM_1)[2]>0){
+    plot(x = LM_MR_4_1$month, y =  LM_MR_4_1$Avg_Air_tmp,xlab = "month", ylab = "Air_tmp",main = paste("month",i,sep = "_"))
+    abline(coef(LM_1)[1],coef(LM_1)[2], col="RED")
+  
+  }
+  
+  if(coef(LM_1)[2]<0){
+    plot(x = LM_MR_4_1$month, y =  LM_MR_4_1$Avg_Air_tmp,xlab = "month", ylab = "Air_tmp",main = paste("month",i,sep = "_"))
+    abline(coef(LM_1)[1],coef(LM_1)[2], col="BLUE")
+  
+  }
+}
+
+#plot water_tmp
+par(mfrow=c(3,4))
+for(i in 1:12){
+  LM_MR_4_2 <- filter(MR_4_2,month(month)==i)
+  LM_2 <- lm(Avg_Water_tmp~month,data = LM_MR_4_2)
+
+  if(coef(LM_2)[2]>0){
+    plot(x = LM_MR_4_2$month, y =  LM_MR_4_2$Avg_Water_tmp,xlab = "month", ylab = "Water_tmp",main = paste("month",i,sep = "_"))
+    abline(coef(LM_2)[1],coef(LM_2)[2], col="RED")
+  
+  }
+  
+  if(coef(LM_2)[2]<0){
+    plot(x = LM_MR_4_2$month, y =  LM_MR_4_2$Avg_Water_tmp,xlab = "month", ylab = "Water_tmp",main = paste("month",i,sep = "_"))
+    abline(coef(LM_2)[1],coef(LM_2)[2], col="BLUE")
+  
+  }
+}
+```
+
+From the output above, for air temperature versus date, the coefficient is negative in 8 months and the positive in 4 months. Besides, for water temperature versus date, the coefficient is negative in 8 months and positive in 4 months too. So we have a reason to predict that the overall temperature trend is going downwards. 
+
+
+5 Time Series
+
+We use ARIMA model in time series as a support to our analysis. The graphs are shown as follows.
+
+###Fit lm model
+```{r}
+#create TS
+TS_MR_4_1 <- ts(select(MR_4_1,Avg_Air_tmp))
+
+#check trend
+plot(TS_MR_4_1,type="b")
+
+#set seasonal index
+diff12 = diff(TS_MR_4_1,12)
+plot(diff12,type="b")
+
+#check acf pacf
+acf2(diff12,48)
+
+#fit model
+sarima(TS_MR_4_1,1,0,0,0,1,1,12)
+
+#predict
+sarima.for(TS_MR_4_1,24,1,0,0,0,1,1,12)
+
+#repeat process for water_tmp
+TS_MR_4_2 <- ts(select(MR_4_2,Avg_Water_tmp))
+plot(TS_MR_4_2,type="b")
+diff12 = diff(TS_MR_4_2,12)
+plot(diff12,type="b")
+acf2(diff12,48)
+sarima(TS_MR_4_2,1,0,0,0,1,1,12)
+sarima.for(TS_MR_4_2,24,1,0,0,0,1,1,12)
+```
+
+
+6 Conclusion
+
+From the statistical analysis above, we can predict that the overall temperature trend in Boston is going downwards, which may have a little conflict with our assumption at first. But the data has its own limitations. First, the data collected is only from Boston area, it cannot represent the trend in global. Besides there are many other factors that may contribute the result, such as ocean current. Even though the result here doesn't cater to the public belief that the world is become warmer and warmer, we still have to be respectful to our nature and live a environmental friendly life.
